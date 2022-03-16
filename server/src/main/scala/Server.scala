@@ -1,52 +1,59 @@
 package fr.dopolytech.polydrive
 
-import akka.actor.typed.ActorSystem
 import akka.actor.typed.scaladsl.Behaviors
-import akka.http.scaladsl.Http
-import akka.http.scaladsl.model.{HttpRequest, HttpResponse}
+import akka.actor.typed.{ActorRef, ActorSystem, Behavior}
+import akka.cluster.sharding.typed.ShardingEnvelope
+import akka.cluster.sharding.typed.scaladsl.{
+  ClusterSharding,
+  Entity,
+  EntityTypeKey
+}
 import com.typesafe.config.ConfigFactory
-import grpc.FileManagerServiceHandler
 
-import scala.concurrent.duration.DurationInt
-import scala.concurrent.{ExecutionContext, Future}
-import scala.util.{Failure, Success}
+import scala.concurrent.ExecutionContext
 
 object Server {
+  object RootBehavior {
+    def apply(): Behavior[Nothing] = Behaviors.setup[Nothing] { context =>
+      context.spawn(ClusterListener(), "ClusterListener")
+
+      Behaviors.empty
+    }
+  }
+
   def main(args: Array[String]): Unit = {
-    val conf = ConfigFactory
-      .parseString("akka.http.server.preview.enable-http2 = on")
-      .withFallback(ConfigFactory.defaultApplication())
-    val system = ActorSystem[Nothing](Behaviors.empty, "Server", conf)
+    startup()
+  }
+
+  def startup(): Unit = {
+    val config = ConfigFactory
+      .parseString(s"""
+        akka.http.server.preview.enable-http2 = on
+        """)
+      .withFallback(ConfigFactory.load())
+
+    val clusterName = config.getString("clustering.cluster.name")
+    val grpcPort = config.getString("clustering.grpc.port").toInt
+    val system = ActorSystem[Nothing](RootBehavior(), clusterName, config)
+    new FileManager(system).run(grpcPort)
     new Server(system).run()
   }
 }
 
 class Server(system: ActorSystem[_]) {
-  def run(): Future[Http.ServerBinding] = {
+  def run(): Unit = {
     implicit val sys: ActorSystem[_] = system
     implicit val ec: ExecutionContext = system.executionContext
 
-    val server: HttpRequest => Future[HttpResponse] =
-      FileManagerServiceHandler(new FileManagerServiceImpl(system))
+    val sharding = ClusterSharding(system)
+    val TypeKey = EntityTypeKey[Counter.Command]("Counter")
 
-    val bound: Future[Http.ServerBinding] = Http(system)
-      .newServerAt(interface = "127.0.0.1", port = 8097)
-      .bind(server)
-      .map(_.addToCoordinatedShutdown(hardTerminationDeadline = 10.seconds))
-
-    bound.onComplete {
-      case Success(binding) =>
-        val address = binding.localAddress
-        println(
-          "gRPC server bound to {}:{}",
-          address.getHostString,
-          address.getPort
+    val shardRegion: ActorRef[ShardingEnvelope[Counter.Command]] = {
+      sharding.init(
+        Entity(TypeKey)(createBehavior =
+          entityContext => Counter(entityContext.entityId)
         )
-      case Failure(ex) =>
-        println("Failed to bind gRPC endpoint, terminating system", ex)
-        system.terminate()
+      )
     }
-
-    bound
   }
 }
